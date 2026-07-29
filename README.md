@@ -49,6 +49,27 @@ streamlit run app.py
 **On Streamlit Community Cloud:** push `app.py` + `requirements.txt` to a
 GitHub repo (same folder), then deploy from share.streamlit.io.
 
+## Performance fix (if you deployed an earlier version)
+
+If your app was silently crashing (health check "connection reset by peer",
+no clear error) after uploading several large real files — this was a real
+issue, now fixed. Two problems, both in the file reader:
+
+1. **Memory**: every file was cached at full width/height, even when only 1-2
+   columns were ever used (e.g. EAN + Product ID out of a 16-column, 120k-row
+   Lazada export; 1 column out of 111 in a PH ZeCom tracker). With up to 4
+   marketplace files + Content + ZeCom + 4 inventory snapshots all cached at
+   once, this added up well past Streamlit Cloud's free-tier memory ceiling.
+   Fixed: files are now scanned cheaply for their structure first, then only
+   the specific columns actually needed are loaded and cached.
+2. **Speed**: pandas' `usecols` parameter is *slower* with the `openpyxl`
+   engine at scale (confirmed: 37s → hung well past 60s on a 123k-row file),
+   while `calamine` reads the same file in ~6s and its `usecols` behaves
+   correctly. Engine order was switched to try `calamine` first for actual
+   data reads (falling back to `openpyxl`/`xlrd` if unavailable) — this also
+   happens to be the engine that correctly reads real Shopee exports, which
+   `openpyxl` rejects due to an unrelated strict-validation bug.
+
 ## Notes
 
 - Rows are never silently dropped: unmapped EANs, EANs whose Color No isn't in
