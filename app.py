@@ -61,31 +61,57 @@ def list_sheets(file_bytes, filename):
     return None, [], attempts
 
 
+def _read_excel_any_engine(file_bytes, sheet_name, header, nrows=None):
+    """
+    Try engines in order for the ACTUAL data read, independent of whichever
+    engine list_sheets() used to enumerate sheet names. This matters because
+    some files (confirmed: real Shopee 'mass update' exports) can have their
+    sheet names listed fine by openpyxl, but fail with a ValueError when
+    openpyxl actually reads the data — it strictly validates worksheet view
+    properties (e.g. the frozen-pane 'activePane' attribute) and rejects
+    files where an export tool wrote a non-standard value for it. calamine
+    doesn't do this strict validation and reads such files fine.
+    Returns (df, engine_used, attempts_log).
+    """
+    attempts = []
+    for engine in ["openpyxl", "calamine", "xlrd"]:
+        try:
+            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=header, dtype=str, engine=engine, nrows=nrows)
+            return df, engine, attempts + [f"{engine}: OK"]
+        except ImportError:
+            attempts.append(f"{engine}: not installed (pip install {('python-calamine' if engine=='calamine' else engine)})")
+        except Exception as e:
+            attempts.append(f"{engine}: {type(e).__name__}: {e}")
+    return None, None, attempts
+
+
 @st.cache_data(show_spinner=False)
 def read_preview(file_bytes, filename, engine, sheet_name, nrows=40):
-    bio = io.BytesIO(file_bytes)
-    if engine == "csv":
-        raw = pd.read_csv(bio, header=None, dtype=str, nrows=nrows)
-    elif engine == "html":
-        tables = pd.read_html(bio, header=None)
+    if filename.lower().endswith(".csv"):
+        return pd.read_csv(io.BytesIO(file_bytes), header=None, dtype=str, nrows=nrows)
+    if engine == "html":
+        tables = pd.read_html(io.BytesIO(file_bytes), header=None)
         raw = tables[0].head(nrows)
         raw.columns = range(raw.shape[1])
-    else:
-        raw = pd.read_excel(bio, sheet_name=sheet_name, header=None, dtype=str, engine=engine, nrows=nrows)
-        raw.columns = range(raw.shape[1])
+        return raw
+    raw, used_engine, attempts = _read_excel_any_engine(file_bytes, sheet_name, None, nrows)
+    if raw is None:
+        raise RuntimeError("Could not read data with any engine:\n" + "\n".join(attempts))
+    raw.columns = range(raw.shape[1])
     return raw
 
 
 @st.cache_data(show_spinner=False)
 def read_full(file_bytes, filename, engine, sheet_name, header_row):
-    bio = io.BytesIO(file_bytes)
-    if engine == "csv":
-        df = pd.read_csv(bio, header=header_row, dtype=str)
+    if filename.lower().endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(file_bytes), header=header_row, dtype=str)
     elif engine == "html":
-        tables = pd.read_html(bio, header=header_row)
+        tables = pd.read_html(io.BytesIO(file_bytes), header=header_row)
         df = tables[0]
     else:
-        df = pd.read_excel(bio, sheet_name=sheet_name, header=header_row, dtype=str, engine=engine)
+        df, used_engine, attempts = _read_excel_any_engine(file_bytes, sheet_name, header_row)
+        if df is None:
+            raise RuntimeError("Could not read data with any engine:\n" + "\n".join(attempts))
     df.columns = [str(c) for c in df.columns]
     return df
 
@@ -210,17 +236,28 @@ def read_zip_combined(file_bytes, header_hints):
                 continue
             try:
                 inner_bytes = zf.read(name)
-                engine = "openpyxl" if lower.endswith(".xlsx") else "xlrd"
-                try:
-                    xls = pd.ExcelFile(io.BytesIO(inner_bytes), engine=engine)
-                except Exception:
-                    engine = "calamine"
-                    xls = pd.ExcelFile(io.BytesIO(inner_bytes), engine=engine)
-                sheet = xls.sheet_names[0]
-                preview = pd.read_excel(io.BytesIO(inner_bytes), sheet_name=sheet, header=None, dtype=str, engine=engine, nrows=40)
+                # Sheet name enumeration (cheap; separate from the actual data
+                # read, which gets its own engine-fallback chain below).
+                sheet = 0
+                for list_engine in ["openpyxl", "calamine", "xlrd"]:
+                    try:
+                        xls = pd.ExcelFile(io.BytesIO(inner_bytes), engine=list_engine)
+                        sheet = xls.sheet_names[0]
+                        break
+                    except Exception:
+                        continue
+
+                preview, engine, attempts = _read_excel_any_engine(inner_bytes, sheet, None, nrows=40)
+                if preview is None:
+                    per_file_log.append((name, None, None, "all engines failed: " + "; ".join(attempts)))
+                    continue
                 preview.columns = range(preview.shape[1])
                 hdr = find_header_row(preview, header_hints)
-                df = pd.read_excel(io.BytesIO(inner_bytes), sheet_name=sheet, header=hdr, dtype=str, engine=engine)
+
+                df, engine, attempts = _read_excel_any_engine(inner_bytes, sheet, hdr)
+                if df is None:
+                    per_file_log.append((name, None, None, "all engines failed: " + "; ".join(attempts)))
+                    continue
                 df.columns = [str(c).strip() for c in df.columns]
                 df = df.dropna(axis=0, how="all")
                 df = strip_template_subheader_rows(df)
