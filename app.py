@@ -609,8 +609,17 @@ s4.metric("Flagged: no stock all year", flagged_dead)
 st.dataframe(final_df.head(30), use_container_width=True, height=400)
 
 buf = io.BytesIO()
+
+def _safe_sheet_name(name: str) -> str:
+    # Excel sheet names: max 31 chars, no : \ / ? * [ ]
+    cleaned = re.sub(r"[:\\/?*\[\]]", "-", str(name))
+    return cleaned[:31]
+
 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-    final_df.to_excel(writer, index=False, sheet_name="Master Mapping")
+    final_df.to_excel(writer, index=False, sheet_name="All Marketplaces")
+    for mp_name in final_df["Marketplace"].dropna().unique():
+        mp_df_out = final_df[final_df["Marketplace"] == mp_name]
+        mp_df_out.to_excel(writer, index=False, sheet_name=_safe_sheet_name(mp_name))
 buf.seek(0)
 
 st.download_button(
