@@ -44,7 +44,7 @@ def list_sheets(file_bytes, filename):
     attempts = []
     if filename.lower().endswith(".csv"):
         return "csv", ["(csv)"], ["Detected .csv extension"]
-    for engine in ["openpyxl", "calamine", "xlrd"]:
+    for engine in ["calamine", "openpyxl", "xlrd"]:
         try:
             xls = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
             return engine, xls.sheet_names, attempts + [f"{engine}: OK"]
@@ -61,7 +61,7 @@ def list_sheets(file_bytes, filename):
     return None, [], attempts
 
 
-def _read_excel_any_engine(file_bytes, sheet_name, header, nrows=None):
+def _read_excel_any_engine(file_bytes, sheet_name, header, nrows=None, usecols=None):
     """
     Try engines in order for the ACTUAL data read, independent of whichever
     engine list_sheets() used to enumerate sheet names. This matters because
@@ -71,12 +71,18 @@ def _read_excel_any_engine(file_bytes, sheet_name, header, nrows=None):
     properties (e.g. the frozen-pane 'activePane' attribute) and rejects
     files where an export tool wrote a non-standard value for it. calamine
     doesn't do this strict validation and reads such files fine.
+    `usecols`, when given, limits which columns pandas actually loads — this
+    is the main memory lever for wide/tall files where only 1-2 columns are
+    actually needed (e.g. EAN + PID out of a 16-column, 120k-row export).
     Returns (df, engine_used, attempts_log).
     """
     attempts = []
-    for engine in ["openpyxl", "calamine", "xlrd"]:
+    for engine in ["calamine", "openpyxl", "xlrd"]:
         try:
-            df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=header, dtype=str, engine=engine, nrows=nrows)
+            df = pd.read_excel(
+                io.BytesIO(file_bytes), sheet_name=sheet_name, header=header,
+                dtype=str, engine=engine, nrows=nrows, usecols=usecols,
+            )
             return df, engine, attempts + [f"{engine}: OK"]
         except ImportError:
             attempts.append(f"{engine}: not installed (pip install {('python-calamine' if engine=='calamine' else engine)})")
@@ -110,6 +116,30 @@ def read_full(file_bytes, filename, engine, sheet_name, header_row):
         df = tables[0]
     else:
         df, used_engine, attempts = _read_excel_any_engine(file_bytes, sheet_name, header_row)
+        if df is None:
+            raise RuntimeError("Could not read data with any engine:\n" + "\n".join(attempts))
+    df.columns = [str(c) for c in df.columns]
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def read_full_narrow(file_bytes, filename, engine, sheet_name, header_row, usecols):
+    """
+    Same as read_full, but only loads the given columns (by name). This is the
+    main memory fix for this app: it uploads up to 4 marketplace files + a
+    Content file + a ZeCom tracker + up to 4 inventory files in one session,
+    but each of those only ever needs 1-2 columns out of however many the
+    source file has. Caching a 2-column result instead of the full 16-111
+    column file is the difference between this staying well under Streamlit
+    Cloud's memory ceiling and silently crashing under it.
+    """
+    if filename.lower().endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(file_bytes), header=header_row, dtype=str, usecols=usecols)
+    elif engine == "html":
+        tables = pd.read_html(io.BytesIO(file_bytes), header=header_row)
+        df = tables[0][usecols]
+    else:
+        df, used_engine, attempts = _read_excel_any_engine(file_bytes, sheet_name, header_row, usecols=usecols)
         if df is None:
             raise RuntimeError("Could not read data with any engine:\n" + "\n".join(attempts))
     df.columns = [str(c) for c in df.columns]
@@ -239,7 +269,7 @@ def read_zip_combined(file_bytes, header_hints):
                 # Sheet name enumeration (cheap; separate from the actual data
                 # read, which gets its own engine-fallback chain below).
                 sheet = 0
-                for list_engine in ["openpyxl", "calamine", "xlrd"]:
+                for list_engine in ["calamine", "openpyxl", "xlrd"]:
                     try:
                         xls = pd.ExcelFile(io.BytesIO(inner_bytes), engine=list_engine)
                         sheet = xls.sheet_names[0]
@@ -286,9 +316,167 @@ def read_zip_combined(file_bytes, header_hints):
     return combined, per_file_log
 
 
+@st.cache_data(show_spinner=False)
+def read_zip_combined_narrow(file_bytes, header_hints, ean_hints, pid_hints):
+    """
+    Same idea as read_zip_combined, but for each inner file: detect its header,
+    guess EAN/PID from that file's own column names, and load ONLY those 2
+    columns (standardized to 'EAN'/'PID') before concatenating. A 24-file
+    Shopee ZIP previously meant holding 24 full-width dataframes in memory at
+    once before ever trimming down to what's needed — this keeps peak memory
+    to roughly 2 columns x total rows, regardless of how wide each source file is.
+    Returns (combined_df, per_file_log).
+    """
+    per_file_log = []
+    frames = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+        for name in zf.namelist():
+            lower = name.lower()
+            if not (lower.endswith(".xlsx") or lower.endswith(".xls")):
+                continue
+            if "__macosx" in lower or name.startswith("."):
+                continue
+            try:
+                inner_bytes = zf.read(name)
+                sheet = 0
+                for list_engine in ["calamine", "openpyxl", "xlrd"]:
+                    try:
+                        xls = pd.ExcelFile(io.BytesIO(inner_bytes), engine=list_engine)
+                        sheet = xls.sheet_names[0]
+                        break
+                    except Exception:
+                        continue
+
+                preview, engine, attempts = _read_excel_any_engine(inner_bytes, sheet, None, nrows=40)
+                if preview is None:
+                    per_file_log.append((name, None, None, "all engines failed: " + "; ".join(attempts)))
+                    continue
+                preview.columns = range(preview.shape[1])
+                hdr = find_header_row(preview, header_hints)
+
+                header_vals = preview.iloc[hdr].tolist() if hdr < len(preview) else []
+                col_names = []
+                for i, h in enumerate(header_vals):
+                    h_str = str(h).strip() if pd.notna(h) and str(h).strip().lower() not in ("", "nan", "none") else None
+                    col_names.append(h_str or f"Unnamed: {i}")
+                col_names = _dedupe_like_pandas(col_names)
+
+                ean_col = guess_column(col_names, ean_hints)
+                pid_col = guess_column(col_names, pid_hints)
+                if ean_col is None:
+                    per_file_log.append((name, hdr, None, "could not find an EAN/SKU column"))
+                    continue
+                wanted = list(dict.fromkeys([c for c in [ean_col, pid_col] if c]))
+
+                df, engine, attempts = _read_excel_any_engine(inner_bytes, sheet, hdr, usecols=wanted)
+                if df is None:
+                    per_file_log.append((name, hdr, None, "all engines failed: " + "; ".join(attempts)))
+                    continue
+                df.columns = [str(c).strip() for c in df.columns]
+                df = df.dropna(axis=0, how="all")
+                df = strip_template_subheader_rows(df)
+                rename_map = {ean_col: "EAN"}
+                if pid_col:
+                    rename_map[pid_col] = "PID"
+                df = df.rename(columns=rename_map)
+                if "PID" not in df.columns:
+                    df["PID"] = None
+                frames.append(df[["EAN", "PID"]])
+                per_file_log.append((name, hdr, df.shape, None))
+            except Exception as e:
+                per_file_log.append((name, None, None, str(e)))
+
+    if not frames:
+        return None, per_file_log
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    combined = combined.dropna(axis=0, how="all")
+    return combined, per_file_log
+
+
+def _dedupe_like_pandas(names):
+    """Mirror pandas' own column-dedup convention (Col, Col.1, Col.2, ...) so
+    column names guessed from a cheap preview match what a real pandas read
+    with usecols=[...] will actually produce."""
+    seen = {}
+    result = []
+    for n in names:
+        if n not in seen:
+            seen[n] = 0
+            result.append(n)
+        else:
+            seen[n] += 1
+            result.append(f"{n}.{seen[n]}")
+    return result
+
+
+def detect_file_structure(label, uploaded_file, header_hints, key_prefix, default_sheet_hint=None):
+    """
+    Cheap structure detection ONLY — sheet, header row, and column names from a
+    small preview. Does NOT load the full file, so this stays fast and light
+    regardless of how large the actual file is. The caller decides which 1-2
+    columns it actually needs and loads only those via read_full_narrow.
+    Returns (file_bytes, engine, sheet_name, header_row, column_names, labels)
+    or (None, None, None, None, None, None) if the file can't be read.
+    """
+    if uploaded_file is None:
+        return None, None, None, None, None, None
+    file_bytes = uploaded_file.getvalue()
+    engine, sheet_names, attempt_log = list_sheets(file_bytes, uploaded_file.name)
+    if engine is None:
+        st.error(_read_error_message(label, attempt_log))
+        return None, None, None, None, None, None
+
+    sheet_name = sheet_names[0]
+    if len(sheet_names) > 1 and default_sheet_hint:
+        for s in sheet_names:
+            if default_sheet_hint.lower() == str(s).lower():
+                sheet_name = s
+                break
+
+    with st.spinner(f"Scanning {label}…"):
+        raw = read_preview(file_bytes, uploaded_file.name, engine, sheet_name)
+        auto_header_row = find_header_row(raw, header_hints)
+
+    with st.expander(f"⚙️ Fix detection for {label} (only open if something looks wrong)"):
+        if len(sheet_names) > 1:
+            sheet_name = st.selectbox("Sheet", options=sheet_names, index=sheet_names.index(sheet_name), key=f"{key_prefix}_sheet")
+            raw = read_preview(file_bytes, uploaded_file.name, engine, sheet_name)
+            auto_header_row = find_header_row(raw, header_hints)
+        st.dataframe(raw.head(12), use_container_width=True, height=200)
+        header_row = st.number_input("Header row (0 = first row)", min_value=0, max_value=500, value=int(auto_header_row), key=f"{key_prefix}_header_row")
+    header_row = int(header_row)
+
+    if header_row >= len(raw):
+        raw = read_preview(file_bytes, uploaded_file.name, engine, sheet_name, nrows=header_row + 10)
+
+    header_vals = raw.iloc[header_row].tolist() if header_row < len(raw) else []
+    col_names = []
+    for i, h in enumerate(header_vals):
+        h_str = str(h).strip() if pd.notna(h) and str(h).strip().lower() not in ("", "nan", "none") else None
+        col_names.append(h_str or f"Unnamed: {i}")
+    col_names = _dedupe_like_pandas(col_names)
+
+    banner_vals = raw.iloc[header_row - 1].tolist() if header_row > 0 else [None] * len(col_names)
+    labels = build_label_map(col_names, banner_vals)
+
+    return file_bytes, engine, sheet_name, header_row, col_names, labels
+
+
+def load_narrow(file_bytes, filename, engine, sheet_name, header_row, wanted_cols):
+    """Load ONLY the given columns for the full file, then apply the same
+    blank-row / template-subheader-row cleanup as the wide path."""
+    df = read_full_narrow(file_bytes, filename, engine, sheet_name, header_row, list(dict.fromkeys(wanted_cols)))
+    df = df.dropna(axis=0, how="all")
+    df = strip_template_subheader_rows(df)
+    return df
+
+
 def read_single_file_auto(label, uploaded_file, header_hints, key_prefix, default_sheet_hint=None, is_zip=False):
     """Full pipeline for one uploaded file: auto sheet/header detection, with a
-    collapsed 'fix it' expander as the only manual override. Returns (df, labels)."""
+    collapsed 'fix it' expander as the only manual override. Returns (df, labels).
+    NOTE: loads the file at FULL width — only used for the ZeCom file now, since
+    that one needs its whole column list shown to pick the parent-key column."""
     if uploaded_file is None:
         return None, None
     file_bytes = uploaded_file.getvalue()
@@ -442,25 +630,59 @@ listing_frames = []
 for name, (f, is_zip) in marketplace_uploads.items():
     if f is None:
         continue
-    df, labels = read_single_file_auto(f"{name} listing file", f, MARKETPLACE_HEADER_HINTS, f"mp_{name}", is_zip=is_zip)
-    if df is None:
+
+    if is_zip:
+        file_bytes = f.getvalue()
+        with st.spinner(f"Unzipping and combining {name}…"):
+            df, per_file_log = read_zip_combined_narrow(
+                file_bytes, MARKETPLACE_HEADER_HINTS, MARKETPLACE_EAN_HINTS[name], MARKETPLACE_PID_HINTS[name]
+            )
+        if df is None:
+            st.error(f"Could not find any readable Excel files inside the ZIP for {name}.")
+            for fname, hdr, shape, err in per_file_log:
+                if err:
+                    st.caption(f"- {fname}: failed — {err}")
+            continue
+        with st.expander(f"📦 {name} — {len(per_file_log)} file(s) found in ZIP"):
+            for fname, hdr, shape, err in per_file_log:
+                st.caption(f"- {fname}: ⚠ skipped ({err})" if err else f"- {fname}: header row {hdr}, {shape[0]} rows × {shape[1]} cols")
+            st.caption(f"Combined: {df.shape[0]} rows total.")
+        sub = pd.DataFrame({
+            "EAN": df["EAN"].apply(lambda v: clean_id_str(v, normalize_keys)),
+            "Marketplace": name,
+            "Marketplace PID": df["PID"].apply(lambda v: clean_id_str(v, False)),
+        })
+        sub = sub.dropna(subset=["EAN"])
+        listing_frames.append(sub)
+        st.caption(f"✓ {name}: {len(sub)} listed EAN rows detected")
         continue
-    ean_guess = guess_column(df.columns, MARKETPLACE_EAN_HINTS[name])
-    pid_guess = guess_column(df.columns, MARKETPLACE_PID_HINTS[name])
+
+    file_bytes, engine, sheet_name, header_row, col_names, labels = detect_file_structure(
+        f"{name} listing file", f, MARKETPLACE_HEADER_HINTS, f"mp_{name}"
+    )
+    if file_bytes is None:
+        continue
+
+    ean_guess = guess_column(col_names, MARKETPLACE_EAN_HINTS[name])
+    pid_guess = guess_column(col_names, MARKETPLACE_PID_HINTS[name])
     with st.expander(f"⚙️ Fix {name} column detection"):
         c1, c2 = st.columns(2)
         with c1:
             ean_col = st.selectbox(
-                f"{name} — EAN / Seller SKU column", options=list(df.columns),
-                index=list(df.columns).index(ean_guess) if ean_guess in df.columns else 0,
+                f"{name} — EAN / Seller SKU column", options=col_names,
+                index=col_names.index(ean_guess) if ean_guess in col_names else 0,
                 format_func=lambda c: labels.get(c, c), key=f"{name}_ean_col",
             )
         with c2:
             pid_col = st.selectbox(
-                f"{name} — Product ID column", options=list(df.columns),
-                index=list(df.columns).index(pid_guess) if pid_guess in df.columns else 0,
+                f"{name} — Product ID column", options=col_names,
+                index=col_names.index(pid_guess) if pid_guess in col_names else 0,
                 format_func=lambda c: labels.get(c, c), key=f"{name}_pid_col",
             )
+
+    with st.spinner(f"Loading {name}…"):
+        df = load_narrow(file_bytes, f.name, engine, sheet_name, header_row, [ean_col, pid_col])
+
     sub = pd.DataFrame({
         "EAN": df[ean_col].apply(lambda v: clean_id_str(v, normalize_keys)),
         "Marketplace": name,
@@ -481,26 +703,31 @@ master = pd.concat(listing_frames, ignore_index=True)
 # ---------------------------------------------------------------------------
 
 st.subheader("Content file")
-content_df, content_labels = read_single_file_auto("Content file", content_file, CONTENT_HEADER_HINTS, "content")
-if content_df is None:
+content_bytes, content_engine, content_sheet, content_header_row, content_col_names, content_labels = detect_file_structure(
+    "Content file", content_file, CONTENT_HEADER_HINTS, "content"
+)
+if content_bytes is None:
     st.stop()
 
-content_ean_guess = guess_column(content_df.columns, CONTENT_EAN_HINTS)
-content_parent_guess = guess_column(content_df.columns, CONTENT_PARENT_HINTS)
+content_ean_guess = guess_column(content_col_names, CONTENT_EAN_HINTS)
+content_parent_guess = guess_column(content_col_names, CONTENT_PARENT_HINTS)
 with st.expander("⚙️ Fix Content file column detection"):
     cc1, cc2 = st.columns(2)
     with cc1:
         content_ean_col = st.selectbox(
-            "EAN column", options=list(content_df.columns),
-            index=list(content_df.columns).index(content_ean_guess) if content_ean_guess in content_df.columns else 0,
+            "EAN column", options=content_col_names,
+            index=content_col_names.index(content_ean_guess) if content_ean_guess in content_col_names else 0,
             format_func=lambda c: content_labels.get(c, c), key="content_ean_col",
         )
     with cc2:
         content_parent_col = st.selectbox(
-            "Color No / Article No column", options=list(content_df.columns),
-            index=list(content_df.columns).index(content_parent_guess) if content_parent_guess in content_df.columns else 0,
+            "Color No / Article No column", options=content_col_names,
+            index=content_col_names.index(content_parent_guess) if content_parent_guess in content_col_names else 0,
             format_func=lambda c: content_labels.get(c, c), key="content_parent_col",
         )
+
+with st.spinner("Loading Content file…"):
+    content_df = load_narrow(content_bytes, content_file.name, content_engine, content_sheet, content_header_row, [content_ean_col, content_parent_col])
 
 content_df["_EAN_KEY"] = content_df[content_ean_col].apply(lambda v: clean_id_str(v, normalize_keys))
 content_df["_PARENT_KEY"] = content_df[content_parent_col].apply(lambda v: clean_id_str(v, normalize_keys))
@@ -519,15 +746,19 @@ master["Color No"] = master["EAN"].apply(lambda v: clean_id_str(v, normalize_key
 zecom_valid_set = None
 if zecom_file is not None:
     st.subheader("ZeCom tracker")
-    zecom_df, zecom_labels = read_single_file_auto("ZeCom tracker", zecom_file, ZECOM_HEADER_HINTS, "zecom", default_sheet_hint=region)
-    if zecom_df is not None:
-        zecom_parent_guess = guess_column(zecom_df.columns, ZECOM_PARENT_HINTS)
+    zecom_bytes, zecom_engine, zecom_sheet, zecom_header_row, zecom_col_names, zecom_labels = detect_file_structure(
+        "ZeCom tracker", zecom_file, ZECOM_HEADER_HINTS, "zecom", default_sheet_hint=region
+    )
+    if zecom_bytes is not None:
+        zecom_parent_guess = guess_column(zecom_col_names, ZECOM_PARENT_HINTS)
         with st.expander("⚙️ Fix ZeCom join-key column detection"):
             zecom_parent_col = st.selectbox(
-                "PIM_Article# / Color No / Style# column", options=list(zecom_df.columns),
-                index=list(zecom_df.columns).index(zecom_parent_guess) if zecom_parent_guess in zecom_df.columns else 0,
+                "PIM_Article# / Color No / Style# column", options=zecom_col_names,
+                index=zecom_col_names.index(zecom_parent_guess) if zecom_parent_guess in zecom_col_names else 0,
                 format_func=lambda c: zecom_labels.get(c, c), key="zecom_parent_col",
             )
+        with st.spinner("Loading ZeCom tracker…"):
+            zecom_df = load_narrow(zecom_bytes, zecom_file.name, zecom_engine, zecom_sheet, zecom_header_row, [zecom_parent_col])
         zecom_keys = zecom_df[zecom_parent_col].apply(lambda v: clean_id_str(v, normalize_keys))
         zecom_valid_set = set(zecom_keys.dropna().unique())
 
@@ -549,25 +780,29 @@ stock_cols = []
 if active_periods:
     st.subheader("Inventory snapshots")
     for label, f in active_periods:
-        df, labels = read_single_file_auto(f"{label} inventory", f, INVENTORY_HEADER_HINTS, f"inv_{label}")
-        if df is None:
+        inv_bytes, inv_engine, inv_sheet, inv_header_row, inv_col_names, inv_labels = detect_file_structure(
+            f"{label} inventory", f, INVENTORY_HEADER_HINTS, f"inv_{label}"
+        )
+        if inv_bytes is None:
             continue
-        ean_guess = guess_column(df.columns, INVENTORY_EAN_HINTS)
-        stock_guess = guess_column(df.columns, INVENTORY_STOCK_HINTS)
+        ean_guess = guess_column(inv_col_names, INVENTORY_EAN_HINTS)
+        stock_guess = guess_column(inv_col_names, INVENTORY_STOCK_HINTS)
         with st.expander(f"⚙️ Fix {label} inventory column detection"):
             c1, c2 = st.columns(2)
             with c1:
                 inv_ean_col = st.selectbox(
-                    f"{label} — EAN column", options=list(df.columns),
-                    index=list(df.columns).index(ean_guess) if ean_guess in df.columns else 0,
-                    format_func=lambda c: labels.get(c, c), key=f"inv_{label}_ean_col",
+                    f"{label} — EAN column", options=inv_col_names,
+                    index=inv_col_names.index(ean_guess) if ean_guess in inv_col_names else 0,
+                    format_func=lambda c: inv_labels.get(c, c), key=f"inv_{label}_ean_col",
                 )
             with c2:
                 inv_stock_col = st.selectbox(
-                    f"{label} — Stock column", options=list(df.columns),
-                    index=list(df.columns).index(stock_guess) if stock_guess in df.columns else 0,
-                    format_func=lambda c: labels.get(c, c), key=f"inv_{label}_stock_col",
+                    f"{label} — Stock column", options=inv_col_names,
+                    index=inv_col_names.index(stock_guess) if stock_guess in inv_col_names else 0,
+                    format_func=lambda c: inv_labels.get(c, c), key=f"inv_{label}_stock_col",
                 )
+        with st.spinner(f"Loading {label} inventory…"):
+            df = load_narrow(inv_bytes, f.name, inv_engine, inv_sheet, inv_header_row, [inv_ean_col, inv_stock_col])
         keyed = df[[inv_ean_col, inv_stock_col]].copy()
         keyed["_EAN_KEY"] = keyed[inv_ean_col].apply(lambda v: clean_id_str(v, normalize_keys))
         keyed["_STOCK_NUM"] = pd.to_numeric(keyed[inv_stock_col], errors="coerce").fillna(0)
@@ -576,7 +811,7 @@ if active_periods:
         col_name = f"Stock_{label}"
         master[col_name] = master["EAN"].apply(lambda v: clean_id_str(v, normalize_keys)).map(lookup).fillna(0)
         stock_cols.append(col_name)
-        st.caption(f"✓ {label} inventory: {len(lookup)} unique EANs read (EAN: {labels.get(inv_ean_col, inv_ean_col)}, Stock: {labels.get(inv_stock_col, inv_stock_col)})")
+        st.caption(f"✓ {label} inventory: {len(lookup)} unique EANs read (EAN: {inv_labels.get(inv_ean_col, inv_ean_col)}, Stock: {inv_labels.get(inv_stock_col, inv_stock_col)})")
 
 if stock_cols:
     master["No Stock All Year"] = (master[stock_cols] == 0).all(axis=1)
