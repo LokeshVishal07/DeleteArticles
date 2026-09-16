@@ -1,0 +1,4 @@
+shared_data/
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
